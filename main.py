@@ -19,7 +19,7 @@ PASSWORD = os.getenv("PASSWORD")
 URLS_FILE = "urls.json"
 RESULTS_FILE = "playwright_results.csv"
 SCREENSHOTS_DIR = "screenshots"
-TIMEOUT = 120000  # Increase timeout to 120 seconds
+TIMEOUT = 12000  # Increase timeout to 120 seconds
 CONCURRENT_INSTANCES = 20  # Number of instances to run concurrently
 
 # Configure logging
@@ -88,6 +88,7 @@ async def worker(browser, login_url: str, username: str, password: str, urls: li
 
     # Process URLs
     for url in urls:
+        screenshot_path = f"{SCREENSHOTS_DIR}/error_{sanitize_filename(url)}.png"
         try:
             logging.info(f"[INSTANCE {instance_id}] Accessing {url}...")
             await page.goto(url, timeout=TIMEOUT)
@@ -101,15 +102,18 @@ async def worker(browser, login_url: str, username: str, password: str, urls: li
             if await check_access_denied(page):
                 status = "Acesso Negado"
                 logging.warning(f"[INSTANCE {instance_id}] Access Denied on {url}.")
+                await page.screenshot(path=screenshot_path)
+                logging.info(f"[INSTANCE {instance_id}] Screenshot saved to {screenshot_path}")
             else:
                 status = "Positivo"
                 logging.info(f"[INSTANCE {instance_id}] Successfully accessed {url}.")
+                await page.screenshot(path=screenshot_path)
+                logging.info(f"[INSTANCE {instance_id}] Screenshot saved to {screenshot_path}")
 
         except Exception as e:
             logging.error(f"[INSTANCE {instance_id}] Error accessing {url}: {str(e)}")
             status = f"Failed - {str(e)}"
             # Take a screenshot on error
-            screenshot_path = f"{SCREENSHOTS_DIR}/error_{sanitize_filename(url)}.png"
             await page.screenshot(path=screenshot_path)
             logging.info(f"[INSTANCE {instance_id}] Screenshot saved to {screenshot_path}")
 
@@ -118,7 +122,7 @@ async def worker(browser, login_url: str, username: str, password: str, urls: li
         logging.info(f"[INSTANCE {instance_id}] {url} - {status}")
 
         # Add a delay between requests
-        await asyncio.sleep(5)  # 5-second delay
+        await asyncio.sleep(3)  # 3-second delay
 
     await context.close()
 
