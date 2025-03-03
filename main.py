@@ -3,9 +3,11 @@ import os
 import json
 import csv
 import logging
+import time
+import asyncio
 from urllib.parse import urlparse
 from pathlib import Path
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 from login_handler import attempt_login
 
 # Load environment variables
@@ -17,10 +19,15 @@ PASSWORD = os.getenv("PASSWORD")
 URLS_FILE = "urls.json"
 RESULTS_FILE = "playwright_results.csv"
 SCREENSHOTS_DIR = "screenshots"
-TIMEOUT = 4000  # Global timeout in milliseconds
+TIMEOUT = 120000  # Increase timeout to 120 seconds
+CONCURRENT_INSTANCES = 20  # Number of instances to run concurrently
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(message)s",
+    datefmt="%H:%M"  # Show only hour and minute
+)
 
 def validate_environment_variables():
     """Validate that required environment variables are set."""
@@ -34,7 +41,7 @@ def load_urls(file_path: str) -> list:
             data = json.load(file)
             return data.get("urls", [])
     except Exception as e:
-        logging.error(f"Failed to load URLs from {file_path}: {str(e)}")
+        logging.error(f"[ERROR] Failed to load URLs from {file_path}: {str(e)}")
         raise
 
 def sanitize_filename(url: str) -> str:
@@ -42,10 +49,10 @@ def sanitize_filename(url: str) -> str:
     parsed_url = urlparse(url)
     return f"{parsed_url.netloc}{parsed_url.path}".replace("/", "_").replace(":", "_")
 
-def check_access_denied(page) -> bool:
+async def check_access_denied(page) -> bool:
     """Check if the page contains 'Você não está autorizado a acessar esta página.' in the body."""
     try:
-        body_text = page.locator("body").text_content(timeout=TIMEOUT)
+        body_text = await page.locator("body").text_content(timeout=TIMEOUT)
         return "Você não está autorizado a acessar esta página." in body_text
     except Exception:
         return False
@@ -57,19 +64,80 @@ def save_results(results: list, file_path: str):
             writer = csv.DictWriter(f, fieldnames=["URL", "Status"])
             writer.writeheader()
             writer.writerows(results)
-        logging.info(f"Results saved to {file_path}")
+        logging.info(f"[SUCCESS] Results saved to {file_path}")
     except Exception as e:
-        logging.error(f"Failed to save results to {file_path}: {str(e)}")
+        logging.error(f"[ERROR] Failed to save results to {file_path}: {str(e)}")
+        raise
 
-def test_urls():
+async def worker(browser, login_url: str, username: str, password: str, urls: list, results: list, instance_id: int):
+    """Worker function to handle a single browser instance."""
+    context = await browser.new_context()
+    page = await context.new_page()
+
+    # Log in
+    try:
+        logging.info(f"[INSTANCE {instance_id}] Logging in...")
+        await page.goto(login_url, timeout=TIMEOUT)
+        await page.wait_for_selector("body", state="visible", timeout=TIMEOUT)
+        await attempt_login(page, username, password)
+        logging.info(f"[INSTANCE {instance_id}] Login successful.")
+    except Exception as e:
+        logging.error(f"[INSTANCE {instance_id}] Login failed: {str(e)}")
+        await context.close()
+        return
+
+    # Process URLs
+    for url in urls:
+        try:
+            logging.info(f"[INSTANCE {instance_id}] Accessing {url}...")
+            await page.goto(url, timeout=TIMEOUT)
+            await page.wait_for_selector("body", state="visible", timeout=TIMEOUT)
+
+            # Check if the page loaded correctly
+            if not await page.is_visible("body"):
+                raise Exception("Page did not load correctly.")
+
+            # Check for "Acesso Negado"
+            if await check_access_denied(page):
+                status = "Acesso Negado"
+                logging.warning(f"[INSTANCE {instance_id}] Access Denied on {url}.")
+            else:
+                status = "Positivo"
+                logging.info(f"[INSTANCE {instance_id}] Successfully accessed {url}.")
+
+        except Exception as e:
+            logging.error(f"[INSTANCE {instance_id}] Error accessing {url}: {str(e)}")
+            status = f"Failed - {str(e)}"
+            # Take a screenshot on error
+            screenshot_path = f"{SCREENSHOTS_DIR}/error_{sanitize_filename(url)}.png"
+            await page.screenshot(path=screenshot_path)
+            logging.info(f"[INSTANCE {instance_id}] Screenshot saved to {screenshot_path}")
+
+        # Log results
+        results.append({"URL": url, "Status": status})
+        logging.info(f"[INSTANCE {instance_id}] {url} - {status}")
+
+        # Add a delay between requests
+        await asyncio.sleep(5)  # 5-second delay
+
+    await context.close()
+
+def split_urls(urls: list, num_instances: int) -> list:
+    """Split the URL list into equal parts for each instance."""
+    chunk_size = len(urls) // num_instances
+    return [urls[i:i + chunk_size] for i in range(0, len(urls), chunk_size)]
+
+async def test_urls():
     """Test all URLs and log their status."""
+    logging.info("[START] Starting URL testing process.")
+
     # Validate environment variables
     validate_environment_variables()
 
     # Load URLs
     urls = load_urls(URLS_FILE)
     if not urls:
-        logging.warning("No URLs found in the file.")
+        logging.warning("[WARNING] No URLs found in the file.")
         return
 
     # Prepare results list
@@ -77,58 +145,36 @@ def test_urls():
 
     # Create screenshots directory
     Path(SCREENSHOTS_DIR).mkdir(exist_ok=True)
+    logging.info(f"[INFO] Screenshots will be saved to {SCREENSHOTS_DIR}.")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context()
-        page = context.new_page()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)  # Run in headful mode for debugging
+        logging.info("[INFO] Browser launched.")
 
-        # Track login status
-        logged_in = False
+        # Split URLs into chunks for each instance
+        url_chunks = split_urls(urls, CONCURRENT_INSTANCES)
+        logging.info(f"[INFO] URLs split into {CONCURRENT_INSTANCES} chunks.")
 
-        for url in urls:
-            try:
-                logging.info(f"Accessing {url}...")
-                page.goto(url, timeout=TIMEOUT)
-                page.wait_for_load_state("networkidle")
+        # Create and run worker tasks
+        tasks = []
+        for i in range(CONCURRENT_INSTANCES):
+            task = worker(browser, "https://takedapro.com.br/", USERNAME, PASSWORD, url_chunks[i], results, i + 1)
+            tasks.append(task)
+        logging.info("[INFO] Worker tasks created.")
 
-                # Check if the page loaded correctly
-                if not page.is_visible("body"):
-                    raise Exception("Page did not load correctly.")
+        # Run all tasks concurrently
+        await asyncio.gather(*tasks)
+        logging.info("[INFO] All worker tasks completed.")
 
-                # Attempt login only if not already logged in
-                if not logged_in:
-                    try:
-                        logging.info("Attempting to log in...")
-                        attempt_login(page, USERNAME, PASSWORD)
-                        logged_in = True  # Set flag to True after successful login
-                    except Exception as e:
-                        logging.warning(f"Login attempt failed: {str(e)}")
-
-                # Check for "Acesso Negado"
-                if check_access_denied(page):
-                    status = "Acesso Negado"
-                else:
-                    status = "Positivo"
-
-            except Exception as e:
-                logging.error(f"Error accessing {url}: {str(e)}")
-                status = f"Failed - {str(e)}"
-
-            # Log results
-            results.append({"URL": url, "Status": status})
-            logging.info(f"{url} - {status}")
-
-            # Save screenshot
-            screenshot_path = f"{SCREENSHOTS_DIR}/{sanitize_filename(url)}.png"
-            page.screenshot(path=screenshot_path)
-
-        # Close browser
-        context.close()
-        browser.close()
+        await browser.close()
+        logging.info("[INFO] Browser closed.")
 
     # Save results to CSV
     save_results(results, RESULTS_FILE)
+    logging.info("[COMPLETE] URL testing process finished.")
 
 if __name__ == "__main__":
-    test_urls()
+    start_time = time.time()
+    asyncio.run(test_urls())
+    end_time = time.time()
+    logging.info(f"[INFO] Script execution time: {end_time - start_time:.2f} seconds")
