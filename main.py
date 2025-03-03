@@ -8,7 +8,7 @@ import asyncio
 from urllib.parse import urlparse
 from pathlib import Path
 from playwright.async_api import async_playwright
-from login_handler import attempt_login
+from modules.login_handler import attempt_login
 
 # Load environment variables
 load_dotenv()
@@ -19,7 +19,7 @@ PASSWORD = os.getenv("PASSWORD")
 URLS_FILE = "urls.json"
 RESULTS_FILE = "playwright_results.csv"
 SCREENSHOTS_DIR = "screenshots"
-TIMEOUT = 12000  # Increase timeout to 120 seconds
+TIMEOUT = 12000  # Timeout in milliseconds
 CONCURRENT_INSTANCES = 20  # Number of instances to run concurrently
 
 # Configure logging
@@ -49,13 +49,27 @@ def sanitize_filename(url: str) -> str:
     parsed_url = urlparse(url)
     return f"{parsed_url.netloc}{parsed_url.path}".replace("/", "_").replace(":", "_")
 
-async def check_access_denied(page) -> bool:
-    """Check if the page contains 'Você não está autorizado a acessar esta página.' in the body."""
+async def check_page_state(page) -> str:
+    """Check the state of the page and return the appropriate status."""
     try:
         body_text = await page.locator("body").text_content(timeout=TIMEOUT)
-        return "Você não está autorizado a acessar esta página." in body_text
+
+        # Check for specific states
+        if "Você não está autorizado a acessar esta página." in body_text:
+            return "Acesso Negado"
+        elif "página não encontrada" in body_text:
+            return "página não encontrada"
+        elif "not found" in body_text.lower():
+            return "not found"
+        elif await page.evaluate("""() => {
+                const status = document.querySelector('h1');
+                return status && status.textContent.includes('404');
+            }"""):
+            return "404"
+        else:
+            return "Positivo"
     except Exception:
-        return False
+        return "Failed - Unknown Error"
 
 def save_results(results: list, file_path: str):
     """Save results to a CSV file."""
@@ -88,34 +102,27 @@ async def worker(browser, login_url: str, username: str, password: str, urls: li
 
     # Process URLs
     for url in urls:
-        screenshot_path = f"{SCREENSHOTS_DIR}/error_{sanitize_filename(url)}.png"
         try:
             logging.info(f"[INSTANCE {instance_id}] Accessing {url}...")
             await page.goto(url, timeout=TIMEOUT)
             await page.wait_for_selector("body", state="visible", timeout=TIMEOUT)
 
-            # Check if the page loaded correctly
-            if not await page.is_visible("body"):
-                raise Exception("Page did not load correctly.")
+            # Check the page state
+            status = await check_page_state(page)
+            logging.info(f"[INSTANCE {instance_id}] Page state: {status}")
 
-            # Check for "Acesso Negado"
-            if await check_access_denied(page):
-                status = "Acesso Negado"
-                logging.warning(f"[INSTANCE {instance_id}] Access Denied on {url}.")
-                await page.screenshot(path=screenshot_path)
-                logging.info(f"[INSTANCE {instance_id}] Screenshot saved to {screenshot_path}")
-            else:
-                status = "Positivo"
-                logging.info(f"[INSTANCE {instance_id}] Successfully accessed {url}.")
-                await page.screenshot(path=screenshot_path)
-                logging.info(f"[INSTANCE {instance_id}] Screenshot saved to {screenshot_path}")
+            # Take a screenshot
+            screenshot_path = f"{SCREENSHOTS_DIR}/{sanitize_filename(url)}.png"
+            await page.screenshot(path=screenshot_path)
+            logging.info(f"[INSTANCE {instance_id}] Screenshot saved to {screenshot_path}")
 
         except Exception as e:
             logging.error(f"[INSTANCE {instance_id}] Error accessing {url}: {str(e)}")
             status = f"Failed - {str(e)}"
             # Take a screenshot on error
+            screenshot_path = f"{SCREENSHOTS_DIR}/error_{sanitize_filename(url)}.png"
             await page.screenshot(path=screenshot_path)
-            logging.info(f"[INSTANCE {instance_id}] Screenshot saved to {screenshot_path}")
+            logging.info(f"[INSTANCE {instance_id}] Error screenshot saved to {screenshot_path}")
 
         # Log results
         results.append({"URL": url, "Status": status})
@@ -152,7 +159,7 @@ async def test_urls():
     logging.info(f"[INFO] Screenshots will be saved to {SCREENSHOTS_DIR}.")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)  # Run in headful mode for debugging
+        browser = await p.chromium.launch(headless=True)  # Run in headless mode
         logging.info("[INFO] Browser launched.")
 
         # Split URLs into chunks for each instance
